@@ -41,7 +41,7 @@ _LIBRARY_STATE_TOKEN_CACHE_TTL_S = 1.0
 
 def _looks_like_windows_path(path):
     text = str(path or '')
-    return bool(re.match(r"^[A-Za-z]:[\\/]", text)) or "\\" in text
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text)) or text.startswith("\\\\")
 
 def _path_module_for(path):
     return ntpath if _looks_like_windows_path(path) else os.path

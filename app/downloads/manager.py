@@ -38,7 +38,7 @@ _state_loaded = False
 
 def _looks_like_windows_path(path):
     text = str(path or "")
-    return bool(re.match(r"^[A-Za-z]:[\\/]", text)) or "\\" in text
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text)) or text.startswith("\\\\")
 
 
 def _path_module_for(path):
