@@ -1,6 +1,7 @@
 import copy
 import gc
 import hashlib
+import ntpath
 import os
 import re
 import shlex
@@ -37,6 +38,21 @@ _library_state_token_cache = {
     'updated_at': 0.0,
 }
 _LIBRARY_STATE_TOKEN_CACHE_TTL_S = 1.0
+
+def _looks_like_windows_path(path):
+    text = str(path or '')
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text)) or "\\" in text
+
+def _path_module_for(path):
+    return ntpath if _looks_like_windows_path(path) else os.path
+
+def _norm_path(path):
+    module = _path_module_for(path)
+    return module.normpath(str(path or ''))
+
+def _join_path(base, *parts):
+    module = _path_module_for(base)
+    return module.join(str(base or ''), *[str(part or '') for part in parts])
 
 def _diag_phase_start(phase, **metadata):
     now = time.time()
@@ -2065,14 +2081,14 @@ def enqueue_organize_paths(filepaths):
         for path in filepaths:
             if not path:
                 continue
-            normalized_path = os.path.normpath(path)
+            normalized_path = _norm_path(path)
             if os.path.isfile(normalized_path):
                 _pending_organize_paths.add(normalized_path)
                 continue
             if os.path.isdir(normalized_path):
                 for root, _, filenames in os.walk(normalized_path):
                     for filename in filenames:
-                        _pending_organize_paths.add(os.path.normpath(os.path.join(root, filename)))
+                        _pending_organize_paths.add(_norm_path(_join_path(root, filename)))
                 continue
             _pending_organize_paths.add(normalized_path)
 
@@ -2083,7 +2099,7 @@ def enqueue_cleanup_roots(paths):
     with _organize_lock:
         for path in paths:
             if path and os.path.isdir(path):
-                _pending_cleanup_roots.add(os.path.normpath(path))
+                _pending_cleanup_roots.add(_norm_path(path))
 
 
 def _cleanup_import_staging_roots(paths):
@@ -2095,7 +2111,7 @@ def _cleanup_import_staging_roots(paths):
                 if is_supported_content_path(filename):
                     continue
                 try:
-                    os.remove(os.path.join(dirpath, filename))
+                    os.remove(_join_path(dirpath, filename))
                 except OSError:
                     continue
             try:

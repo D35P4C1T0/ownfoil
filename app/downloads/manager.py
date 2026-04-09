@@ -1,4 +1,5 @@
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -33,6 +34,35 @@ _state = {
     "completed_identities": set(),
 }
 _state_loaded = False
+
+
+def _looks_like_windows_path(path):
+    text = str(path or "")
+    return bool(re.match(r"^[A-Za-z]:[\\/]", text)) or "\\" in text
+
+
+def _path_module_for(path):
+    return ntpath if _looks_like_windows_path(path) else os.path
+
+
+def _path_join(base, *parts):
+    module = _path_module_for(base)
+    return module.join(str(base or ""), *[str(part or "") for part in parts])
+
+
+def _path_norm(path):
+    module = _path_module_for(path)
+    return module.normpath(str(path or ""))
+
+
+def _path_dirname(path):
+    module = _path_module_for(path)
+    return module.dirname(str(path or ""))
+
+
+def _path_basename(path):
+    module = _path_module_for(path)
+    return module.basename(str(path or ""))
 
 
 def _get_prowlarr_timeout_seconds(prowlarr_cfg):
@@ -1557,7 +1587,7 @@ def _select_update_file_path(src_path, expected_version):
     except (TypeError, ValueError):
         return None
     if os.path.isfile(src_path):
-        version = _extract_update_version_from_name(os.path.basename(src_path))
+        version = _extract_update_version_from_name(_path_basename(src_path))
         return src_path if version == expected_version else None
     if not os.path.isdir(src_path):
         return None
@@ -1566,7 +1596,7 @@ def _select_update_file_path(src_path, expected_version):
         for filename in files:
             version = _extract_update_version_from_name(filename)
             if version == expected_version:
-                path = os.path.join(root, filename)
+                path = _path_join(root, filename)
                 try:
                     size = os.path.getsize(path)
                 except OSError:
@@ -1582,7 +1612,7 @@ def _build_update_destination(dest_root, title_id, title_name, version, src_path
     safe_title = _sanitize_component(title_name or title_id)
     safe_title_id = _sanitize_component(title_id)
     extension = _get_import_extension(src_path)
-    folder = os.path.join(dest_root, f"{safe_title} [{safe_title_id}]", "Updates", f"v{version}")
+    folder = _path_join(dest_root, f"{safe_title} [{safe_title_id}]", "Updates", f"v{version}")
     filename = f"{safe_title} [{safe_title_id}] [UPDATE][v{version}].{extension}"
     filename = _sanitize_component(filename)
     return folder, filename
@@ -1592,14 +1622,14 @@ def _get_import_extension(src_path):
     extension = get_supported_content_extension(src_path)
     if extension:
         return extension
-    return os.path.splitext(os.path.basename(str(src_path or "")))[1].lstrip(".")
+    return os.path.splitext(_path_basename(src_path))[1].lstrip(".")
 
 
 def _cleanup_download_path(src_path, dest_root):
     if not src_path:
         return
     src_is_dir = os.path.isdir(src_path)
-    src_root = src_path if src_is_dir else os.path.dirname(src_path)
+    src_root = src_path if src_is_dir else _path_dirname(src_path)
     if not src_root or not os.path.exists(src_root):
         return
     try:
@@ -1640,7 +1670,7 @@ def _iter_importable_download_files(src_path):
     matches = []
     for root, _, filenames in os.walk(src_path):
         for filename in filenames:
-            candidate = os.path.join(root, filename)
+            candidate = _path_join(root, filename)
             if _is_importable_download_file(candidate):
                 matches.append(candidate)
     return matches
@@ -1648,21 +1678,21 @@ def _iter_importable_download_files(src_path):
 
 def _build_generic_import_destination(dest_root, src_path):
     normalized_extension = _get_import_extension(src_path)
-    basename = os.path.basename(src_path)
+    basename = _path_basename(src_path)
     lowered = basename.lower()
     if normalized_extension and lowered.endswith(f".{normalized_extension}.hdf"):
         basename = basename[:-4]
-    return _ensure_unique_path(os.path.join(dest_root, basename))
+    return _ensure_unique_path(_path_join(dest_root, basename))
 
 def _move_generic_importable_files(src_path, dest_root, excluded_paths=None):
     excluded = {
-        os.path.normcase(os.path.normpath(path))
+        os.path.normcase(_path_norm(path))
         for path in (excluded_paths or [])
         if path
     }
     importable_paths = [
         path for path in _iter_importable_download_files(src_path)
-        if os.path.normcase(os.path.normpath(path)) not in excluded
+        if os.path.normcase(_path_norm(path)) not in excluded
     ]
     if not importable_paths:
         logger.warning("No importable files found in completed download: %s", src_path)
@@ -1672,6 +1702,8 @@ def _move_generic_importable_files(src_path, dest_root, excluded_paths=None):
     try:
         for import_path in importable_paths:
             dest_path = _build_generic_import_destination(dest_root, import_path)
+            if _looks_like_windows_path(dest_root) and _looks_like_windows_path(import_path):
+                dest_path = _path_join(dest_root, _path_basename(dest_path))
             shutil.move(import_path, dest_path)
             dest_path = _normalize_imported_wrapped_files(dest_path)
             moved_paths.append(dest_path)
@@ -1692,7 +1724,7 @@ def _normalize_imported_wrapped_files(dest_path):
         candidate_paths = []
         for root, _, filenames in os.walk(dest_path):
             for filename in filenames:
-                candidate_paths.append(os.path.join(root, filename))
+                candidate_paths.append(_path_join(root, filename))
         is_single_file = False
     else:
         return dest_path
@@ -1712,7 +1744,7 @@ def _normalize_imported_wrapped_files(dest_path):
         try:
             shutil.move(path, normalized_path)
             logger.info("Normalized wrapped import path: %s -> %s", path, normalized_path)
-            if is_single_file and os.path.normpath(path) == os.path.normpath(dest_path):
+            if is_single_file and _path_norm(path) == _path_norm(dest_path):
                 renamed_single_path = normalized_path
         except Exception as e:
             logger.warning("Failed to normalize wrapped import %s: %s", path, e)
@@ -1773,7 +1805,7 @@ def _move_completed_with_reason(item, update_info=None):
                 highest_owned,
             )
         dest_dir, dest_filename = _build_update_destination(dest_root, title_id, title_name, actual_version, update_path)
-        dest_path = os.path.join(dest_dir, dest_filename)
+        dest_path = _path_join(dest_dir, dest_filename)
         dest_path = _ensure_unique_path(dest_path)
         try:
             os.makedirs(dest_dir, exist_ok=True)
@@ -1785,7 +1817,7 @@ def _move_completed_with_reason(item, update_info=None):
             logger.warning("Failed to move update %s: %s", update_path, e)
             return None, str(e)
 
-    if os.path.abspath(os.path.dirname(src_path)) == os.path.abspath(dest_root):
+    if os.path.abspath(_path_dirname(src_path)) == os.path.abspath(dest_root):
         return _normalize_imported_wrapped_files(src_path), None
     return _move_generic_importable_files(src_path, dest_root)
 
