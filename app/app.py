@@ -70,6 +70,8 @@ _media_cache_index = {
     'banner': {}, # title_id -> filename
 }
 _media_cache_last_reset = 0
+_media_prefetch_lock = threading.Lock()
+_media_prefetch_running = False
 
 _media_resize_lock = threading.Lock()
 
@@ -254,6 +256,148 @@ def _ensure_cached_media_file(cache_dir, title_id, remote_url):
     cache_name = f"{title_id.upper()}{ext}"
     cache_path = os.path.join(cache_dir, cache_name)
     return cache_name, cache_path
+
+def _normalize_media_url(remote_url):
+    url = str(remote_url or '').strip()
+    if not url:
+        return ''
+    if url.startswith('//'):
+        url = 'https:' + url
+    return url
+
+def _cache_media_asset(title_id, media_kind, remote_url, headers=None, only_missing=False):
+    title_id = str(title_id or '').strip().upper()
+    if not title_id:
+        return 'missing', None
+
+    media_kind = 'banner' if str(media_kind or '').strip().lower() == 'banner' else 'icon'
+    cache_dir = os.path.join(CACHE_DIR, 'banners' if media_kind == 'banner' else 'icons')
+    os.makedirs(cache_dir, exist_ok=True)
+
+    media_url = _normalize_media_url(remote_url)
+    cache_name, cache_path = _ensure_cached_media_file(cache_dir, title_id, media_url)
+    if not cache_path:
+        return 'missing', None
+
+    if os.path.exists(cache_path):
+        _remember_cached_media_filename(title_id, cache_name, media_kind=media_kind)
+        return 'skipped', cache_path
+
+    if only_missing and not media_url:
+        return 'missing', None
+
+    try:
+        response = requests.get(media_url, timeout=10, headers=headers or None)
+        if response.status_code != 200:
+            return 'failed', {'title_id': title_id, 'status': response.status_code, 'url': media_url}
+        with open(cache_path, 'wb') as handle:
+            handle.write(response.content)
+    except Exception as e:
+        return 'failed', {
+            'title_id': title_id,
+            'status': 'error',
+            'url': media_url,
+            'message': str(e),
+        }
+
+    _remember_cached_media_filename(title_id, cache_name, media_kind=media_kind)
+    size, _variant_dir, variant_path = _get_variant_path(cache_dir, cache_name, media_kind=media_kind)
+    if variant_path:
+        with _media_resize_lock:
+            _resize_image_to_path(cache_path, variant_path, size=size)
+    return 'fetched', cache_path
+
+def _prefetch_media_cache(prefetch_ids, media_kind, headers=None, only_missing=True):
+    media_kind = 'banner' if str(media_kind or '').strip().lower() == 'banner' else 'icon'
+    fetched = 0
+    skipped = 0
+    missing = 0
+    failed = 0
+    failures = []
+
+    titles.load_titledb()
+    try:
+        for title_id in list(prefetch_ids or []):
+            normalized_title_id = str(title_id or '').strip().upper()
+            if not normalized_title_id:
+                missing += 1
+                continue
+
+            info = titles.get_game_info(normalized_title_id) or {}
+            remote_url = info.get('bannerUrl') if media_kind == 'banner' else info.get('iconUrl')
+            if not _normalize_media_url(remote_url):
+                missing += 1
+                continue
+            status, payload = _cache_media_asset(
+                normalized_title_id,
+                media_kind,
+                remote_url,
+                headers=headers,
+                only_missing=only_missing,
+            )
+            if status == 'fetched':
+                fetched += 1
+            elif status == 'skipped':
+                skipped += 1
+            elif status == 'missing':
+                missing += 1
+            else:
+                failed += 1
+                if payload and len(failures) < 5:
+                    failures.append(payload)
+    finally:
+        titles.release_titledb()
+
+    return {
+        'success': True,
+        'fetched': fetched,
+        'skipped': skipped,
+        'missing': missing,
+        'failed': failed,
+        'failures': failures,
+    }
+
+def _run_missing_media_prefetch():
+    global _media_prefetch_running
+    try:
+        with app.app_context():
+            prefetch_ids = _get_media_prefetch_ids()
+            if not prefetch_ids:
+                return
+            headers = {'User-Agent': 'AeroFoil/1.0'}
+            icon_results = _prefetch_media_cache(prefetch_ids, 'icon', headers=headers, only_missing=True)
+            banner_results = _prefetch_media_cache(prefetch_ids, 'banner', headers=headers, only_missing=True)
+            logger.info(
+                "Media warmup finished: icons fetched=%s skipped=%s missing=%s failed=%s; banners fetched=%s skipped=%s missing=%s failed=%s.",
+                icon_results.get('fetched'),
+                icon_results.get('skipped'),
+                icon_results.get('missing'),
+                icon_results.get('failed'),
+                banner_results.get('fetched'),
+                banner_results.get('skipped'),
+                banner_results.get('missing'),
+                banner_results.get('failed'),
+            )
+    except Exception as e:
+        logger.warning("Background media warmup failed: %s", e)
+    finally:
+        with _media_prefetch_lock:
+            _media_prefetch_running = False
+
+def _schedule_missing_media_prefetch():
+    global _media_prefetch_running
+    with _media_prefetch_lock:
+        if _media_prefetch_running:
+            return False
+        _media_prefetch_running = True
+    try:
+        threading.Thread(target=_run_missing_media_prefetch, daemon=True).start()
+        return True
+    except Exception as e:
+        with _media_prefetch_lock:
+            _media_prefetch_running = False
+        logger.warning("Failed to start background media warmup: %s", e)
+        return False
 import json
 
 def init():
@@ -3964,155 +4108,15 @@ def _get_media_prefetch_ids():
 @app.post('/api/settings/media-cache/prefetch-icons')
 @access_required('admin')
 def prefetch_media_icons_api():
-    prefetch_ids = _get_media_prefetch_ids()
-    cache_dir = os.path.join(CACHE_DIR, 'icons')
-    os.makedirs(cache_dir, exist_ok=True)
-
-    fetched = 0
-    skipped = 0
-    missing = 0
-    failed = 0
-    failures = []
     headers = {'User-Agent': 'AeroFoil/1.0'}
-
-    titles.load_titledb()
-    try:
-        for title_id in prefetch_ids:
-            if not title_id:
-                missing += 1
-                continue
-            info = titles.get_game_info(title_id)
-            icon_url = (info or {}).get('iconUrl') or ''
-            if not icon_url:
-                missing += 1
-                continue
-            if icon_url.startswith('//'):
-                icon_url = 'https:' + icon_url
-            clean_url = icon_url.split('?', 1)[0]
-            _, ext = os.path.splitext(clean_url)
-            if not ext:
-                ext = '.jpg'
-            cache_name = f"{title_id}{ext}"
-            cache_path = os.path.join(cache_dir, cache_name)
-            if os.path.exists(cache_path):
-                skipped += 1
-                continue
-            try:
-                response = requests.get(icon_url, timeout=10, headers=headers)
-                if response.status_code == 200:
-                    with open(cache_path, 'wb') as handle:
-                        handle.write(response.content)
-                    # Generate a smaller variant for faster web UI loads.
-                    size, variant_dir, variant_path = _get_variant_path(cache_dir, cache_name, media_kind='icon')
-                    if variant_path:
-                        with _media_resize_lock:
-                            _resize_image_to_path(cache_path, variant_path, size=size)
-                    fetched += 1
-                else:
-                    failed += 1
-                    if len(failures) < 5:
-                        failures.append({
-                            'title_id': title_id,
-                            'status': response.status_code,
-                            'url': icon_url
-                        })
-            except Exception as e:
-                failed += 1
-                if len(failures) < 5:
-                    failures.append({
-                        'title_id': title_id,
-                        'status': 'error',
-                        'url': icon_url,
-                        'message': str(e)
-                    })
-    finally:
-        titles.release_titledb()
-
-    return jsonify({
-        'success': True,
-        'fetched': fetched,
-        'skipped': skipped,
-        'missing': missing,
-        'failed': failed,
-        'failures': failures
-    })
+    return jsonify(_prefetch_media_cache(_get_media_prefetch_ids(), 'icon', headers=headers, only_missing=True))
 
 
 @app.post('/api/settings/media-cache/prefetch-banners')
 @access_required('admin')
 def prefetch_media_banners_api():
-    prefetch_ids = _get_media_prefetch_ids()
-    cache_dir = os.path.join(CACHE_DIR, 'banners')
-    os.makedirs(cache_dir, exist_ok=True)
-
-    fetched = 0
-    skipped = 0
-    missing = 0
-    failed = 0
-    failures = []
     headers = {'User-Agent': 'AeroFoil/1.0'}
-
-    titles.load_titledb()
-    try:
-        for title_id in prefetch_ids:
-            if not title_id:
-                missing += 1
-                continue
-            info = titles.get_game_info(title_id)
-            banner_url = (info or {}).get('bannerUrl') or ''
-            if not banner_url:
-                missing += 1
-                continue
-            if banner_url.startswith('//'):
-                banner_url = 'https:' + banner_url
-            clean_url = banner_url.split('?', 1)[0]
-            _, ext = os.path.splitext(clean_url)
-            if not ext:
-                ext = '.jpg'
-            cache_name = f"{title_id}{ext}"
-            cache_path = os.path.join(cache_dir, cache_name)
-            if os.path.exists(cache_path):
-                skipped += 1
-                continue
-            try:
-                response = requests.get(banner_url, timeout=10, headers=headers)
-                if response.status_code == 200:
-                    with open(cache_path, 'wb') as handle:
-                        handle.write(response.content)
-                    # Generate a smaller variant for faster web UI loads.
-                    size, variant_dir, variant_path = _get_variant_path(cache_dir, cache_name, media_kind='banner')
-                    if variant_path:
-                        with _media_resize_lock:
-                            _resize_image_to_path(cache_path, variant_path, size=size)
-                    fetched += 1
-                else:
-                    failed += 1
-                    if len(failures) < 5:
-                        failures.append({
-                            'title_id': title_id,
-                            'status': response.status_code,
-                            'url': banner_url
-                        })
-            except Exception as e:
-                failed += 1
-                if len(failures) < 5:
-                    failures.append({
-                        'title_id': title_id,
-                        'status': 'error',
-                        'url': banner_url,
-                        'message': str(e)
-                    })
-    finally:
-        titles.release_titledb()
-
-    return jsonify({
-        'success': True,
-        'fetched': fetched,
-        'skipped': skipped,
-        'missing': missing,
-        'failed': failed,
-        'failures': failures
-    })
+    return jsonify(_prefetch_media_cache(_get_media_prefetch_ids(), 'banner', headers=headers, only_missing=True))
 
 @app.post('/api/settings/downloads/test-prowlarr')
 @access_required('admin')
@@ -5189,6 +5193,17 @@ def get_all_titles_api():
         .group_by(app_files.c.app_id)
         .subquery()
     )
+    base_rank_subquery = (
+        db.session.query(
+            Apps.id.label('app_pk'),
+            func.row_number().over(
+                partition_by=Apps.title_id,
+                order_by=(Apps.owned.desc(), app_version_num_expr.desc(), Apps.id.desc())
+            ).label('row_rank'),
+        )
+        .filter(Apps.app_type == APP_TYPE_BASE)
+        .subquery()
+    )
     base_status_subquery = (
         db.session.query(
             Apps.title_id.label('title_fk'),
@@ -5303,13 +5318,17 @@ def get_all_titles_api():
         )
         .join(Titles, Apps.title_id == Titles.id)
         .outerjoin(size_subquery, size_subquery.c.app_pk == Apps.id)
+        .outerjoin(base_rank_subquery, base_rank_subquery.c.app_pk == Apps.id)
         .outerjoin(base_status_subquery, base_status_subquery.c.title_fk == Titles.id)
         .outerjoin(update_status_subquery, update_status_subquery.c.title_fk == Titles.id)
         .outerjoin(dlc_agg_subquery, dlc_agg_subquery.c.dlc_app_id == Apps.app_id)
         .outerjoin(dlc_completion_subquery, dlc_completion_subquery.c.title_fk == Titles.id)
         .filter(
             or_(
-                Apps.app_type == APP_TYPE_BASE,
+                and_(
+                    Apps.app_type == APP_TYPE_BASE,
+                    base_rank_subquery.c.row_rank == 1,
+                ),
                 and_(
                     Apps.app_type == APP_TYPE_DLC,
                     app_version_num_expr == dlc_agg_subquery.c.max_version
@@ -6264,8 +6283,8 @@ def shop_icon_api(title_id):
             )
         return response
 
-    cache_name, cache_path = _ensure_cached_media_file(cache_dir, title_id, icon_url)
-    if not cache_path:
+    status, cache_path = _cache_media_asset(title_id, 'icon', icon_url)
+    if status not in ('fetched', 'skipped') or not cache_path:
         response = send_from_directory(app.static_folder, 'placeholder-icon.svg')
         response.headers['Cache-Control'] = 'public, max-age=3600'
         if _is_cyberfoil_request():
@@ -6279,16 +6298,8 @@ def shop_icon_api(title_id):
             )
         return response
 
-    if not os.path.exists(cache_path):
-        try:
-            resp = requests.get(icon_url, timeout=10)
-            if resp.status_code == 200:
-                with open(cache_path, 'wb') as handle:
-                    handle.write(resp.content)
-        except Exception:
-            cache_path = None
-
     if cache_path and os.path.exists(cache_path):
+        cache_name = os.path.basename(cache_path)
         _remember_cached_media_filename(title_id, cache_name, media_kind='icon')
         size, variant_dir, variant_path = _get_variant_path(cache_dir, cache_name, media_kind='icon', size_override=size_override)
         if variant_path:
@@ -6416,8 +6427,8 @@ def shop_banner_api(title_id):
             )
         return response
 
-    cache_name, cache_path = _ensure_cached_media_file(cache_dir, title_id, banner_url)
-    if not cache_path:
+    status, cache_path = _cache_media_asset(title_id, 'banner', banner_url)
+    if status not in ('fetched', 'skipped') or not cache_path:
         response = send_from_directory(app.static_folder, 'placeholder-banner.svg')
         response.headers['Cache-Control'] = 'public, max-age=3600'
         if _is_cyberfoil_request():
@@ -6431,16 +6442,8 @@ def shop_banner_api(title_id):
             )
         return response
 
-    if not os.path.exists(cache_path):
-        try:
-            resp = requests.get(banner_url, timeout=10)
-            if resp.status_code == 200:
-                with open(cache_path, 'wb') as handle:
-                    handle.write(resp.content)
-        except Exception:
-            cache_path = None
-
     if cache_path and os.path.exists(cache_path):
+        cache_name = os.path.basename(cache_path)
         _remember_cached_media_filename(title_id, cache_name, media_kind='banner')
         size, variant_dir, variant_path = _get_variant_path(cache_dir, cache_name, media_kind='banner', size_override=size_override)
         if variant_path:
@@ -6502,6 +6505,7 @@ def _run_post_library_change():
             invalidate_library_cache_state_token()
             titles.load_titledb()
             process_library_identification(app)
+            reconcile_duplicate_base_apps()
             add_missing_apps_to_db()
             update_titles() # Ensure titles are updated after identification
             # Expensive filesystem sweep: run periodically, not on every rebuild.
@@ -6534,6 +6538,7 @@ def _run_post_library_change():
                 now = time.time()
                 payload = _build_shop_sections_payload(50)
                 _store_shop_sections_cache(payload, 50, now, state_token, persist_disk=True)
+                _schedule_missing_media_prefetch()
         finally:
             titles.release_titledb()
             _release_process_memory()

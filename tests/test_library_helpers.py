@@ -22,15 +22,19 @@ try:
     from app.app import _app_has_deletable_files
     from app.app import _build_title_details_dlc_items
     from app.app import _build_deletable_version_map
+    from app.app import _prefetch_media_cache
     from app.app import _sort_library_rows_by_title_name
     from app.app import manage_delete_library_content
     from app.library import (
         _build_staging_output_path,
+        _base_app_sort_key,
         _cleanup_import_staging_roots,
         _delete_target_apps,
         _finalize_staged_conversion_output,
         _format_nsz_command,
+        _is_canonical_base_app,
         _iter_library_files,
+        _merge_base_app_group,
         _pending_cleanup_roots,
         _pending_organize_paths,
         _sanitize_component,
@@ -273,6 +277,94 @@ class LibraryHelperTests(unittest.TestCase):
                 os.path.join("subdir", "update.nsz"),
             ],
         )
+
+    def test_merge_base_app_group_prefers_canonical_v0_and_merges_files(self):
+        title_id = "0100AAAA00000000"
+        shared_file = self._make_file(401, "X:\\library\\Example Title [BASE].xci", [])
+        canonical = self._make_app(11, title_id, "BASE", 0)
+        canonical.owned = False
+        canonical.files = []
+        duplicate = self._make_app(12, title_id, "BASE", 65536)
+        duplicate.owned = True
+        duplicate.files = [shared_file]
+
+        chosen, duplicates, merged_files, normalized = _merge_base_app_group([duplicate, canonical], title_id)
+
+        self.assertIs(chosen, canonical)
+        self.assertEqual(duplicates, [duplicate])
+        self.assertEqual(merged_files, 1)
+        self.assertTrue(normalized)
+        self.assertTrue(chosen.owned)
+        self.assertEqual(chosen.files, [shared_file])
+        self.assertTrue(_is_canonical_base_app(chosen, title_id))
+        self.assertGreater(_base_app_sort_key(chosen, title_id), _base_app_sort_key(duplicate, title_id))
+
+    def test_merge_base_app_group_normalizes_noncanonical_single_base(self):
+        title_id = "0100BBBB00000000"
+        base_app = self._make_app(21, "0100BBBB00000000", "BASE", 131072)
+        base_app.owned = True
+        base_app.files = []
+
+        chosen, duplicates, merged_files, normalized = _merge_base_app_group([base_app], title_id)
+
+        self.assertIs(chosen, base_app)
+        self.assertEqual(duplicates, [])
+        self.assertEqual(merged_files, 0)
+        self.assertTrue(normalized)
+        self.assertEqual(chosen.app_id, title_id)
+        self.assertEqual(chosen.app_version, "0")
+        self.assertTrue(chosen.owned)
+
+    @patch("app.app._cache_media_asset")
+    @patch("app.app.titles.release_titledb")
+    @patch("app.app.titles.get_game_info")
+    @patch("app.app.titles.load_titledb", return_value=True)
+    def test_prefetch_media_cache_reports_counts_for_missing_skipped_and_failures(
+        self,
+        load_titledb_mock,
+        get_game_info_mock,
+        release_titledb_mock,
+        cache_media_asset_mock,
+    ):
+        get_game_info_mock.side_effect = lambda title_id: {
+            "0100AAAA00000000": {"iconUrl": "https://example.invalid/icon-a.jpg"},
+            "0100BBBB00000000": {"iconUrl": ""},
+            "0100CCCC00000000": {"iconUrl": "https://example.invalid/icon-c.jpg"},
+            "0100DDDD00000000": {"iconUrl": "https://example.invalid/icon-d.jpg"},
+        }.get(title_id, {})
+        cache_media_asset_mock.side_effect = [
+            ("fetched", "X:\\cache\\icons\\0100AAAA00000000.jpg"),
+            ("failed", {"title_id": "0100CCCC00000000", "status": 503, "url": "https://example.invalid/icon-c.jpg"}),
+            ("skipped", "X:\\cache\\icons\\0100DDDD00000000.jpg"),
+        ]
+
+        result = _prefetch_media_cache(
+            [
+                "0100AAAA00000000",
+                "",
+                "0100BBBB00000000",
+                "0100CCCC00000000",
+                "0100DDDD00000000",
+            ],
+            "icon",
+            headers={"User-Agent": "AeroFoil/1.0"},
+            only_missing=True,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["fetched"], 1)
+        self.assertEqual(result["skipped"], 1)
+        self.assertEqual(result["missing"], 2)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(result["failures"], [
+            {
+                "title_id": "0100CCCC00000000",
+                "status": 503,
+                "url": "https://example.invalid/icon-c.jpg",
+            }
+        ])
+        load_titledb_mock.assert_called_once_with()
+        release_titledb_mock.assert_called_once_with()
 
     def test_get_dirs_and_files_includes_wrapped_supported_files(self):
         tmp_root = self._make_test_temp_root("get_dirs_and_files")

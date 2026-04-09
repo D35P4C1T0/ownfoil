@@ -442,7 +442,8 @@ def identify_library_files(library):
                                 continue
 
                             app_id = file_content.get("app_id")
-                            app_version = str(file_content.get("version") or "0")
+                            app_type = file_content.get("type")
+                            app_version = "0" if app_type == APP_TYPE_BASE else str(file_content.get("version") or "0")
                             existing_app = Apps.query.filter_by(
                                 app_id=app_id,
                                 app_version=app_version
@@ -456,7 +457,7 @@ def identify_library_files(library):
                                 new_app = Apps(
                                     app_id=app_id,
                                     app_version=app_version,
-                                    app_type=file_content.get("type"),
+                                    app_type=app_type,
                                     owned=True,
                                     title_id=title_id_in_db
                                 )
@@ -510,6 +511,125 @@ def identify_library_files(library):
             include_orphaned=include_orphaned,
             total_candidates=nb_to_identify,
             processed=processed
+        )
+
+def _is_canonical_base_app(app, expected_app_id):
+    return (
+        str(getattr(app, 'app_type', '') or '') == APP_TYPE_BASE
+        and str(getattr(app, 'app_id', '') or '').strip().upper() == str(expected_app_id or '').strip().upper()
+        and str(getattr(app, 'app_version', '0') or '0').strip() == '0'
+    )
+
+def _base_app_sort_key(app, expected_app_id):
+    return (
+        1 if _is_canonical_base_app(app, expected_app_id) else 0,
+        1 if bool(getattr(app, 'owned', False)) else 0,
+        _safe_int(getattr(app, 'app_version', 0)),
+        _safe_int(getattr(app, 'id', 0)),
+    )
+
+def _merge_base_app_group(base_apps, expected_app_id):
+    base_apps = [app for app in list(base_apps or []) if app]
+    expected_app_id = str(expected_app_id or '').strip().upper()
+    if not base_apps or not expected_app_id:
+        return None, [], 0, False
+
+    canonical = max(base_apps, key=lambda app: _base_app_sort_key(app, expected_app_id))
+    duplicates = [app for app in base_apps if app is not canonical]
+    merged_files = 0
+    owned_any = any(bool(getattr(app, 'owned', False)) or bool(list(getattr(app, 'files', []) or [])) for app in base_apps)
+
+    for duplicate in duplicates:
+        for file_entry in list(getattr(duplicate, 'files', []) or []):
+            if file_entry not in canonical.files:
+                canonical.files.append(file_entry)
+                merged_files += 1
+
+    normalized = False
+    if str(getattr(canonical, 'app_id', '') or '').strip().upper() != expected_app_id:
+        canonical.app_id = expected_app_id
+        normalized = True
+    if str(getattr(canonical, 'app_version', '0') or '0').strip() != '0':
+        canonical.app_version = '0'
+        normalized = True
+    if str(getattr(canonical, 'app_type', '') or '') != APP_TYPE_BASE:
+        canonical.app_type = APP_TYPE_BASE
+        normalized = True
+    if bool(getattr(canonical, 'owned', False)) != owned_any:
+        canonical.owned = owned_any
+        normalized = True
+
+    return canonical, duplicates, merged_files, normalized
+
+def reconcile_duplicate_base_apps():
+    phase = 'reconcile_duplicate_base_apps'
+    _diag_phase_start(phase)
+    merged_titles = 0
+    removed_apps = 0
+    merged_files = 0
+    normalized_apps = 0
+    _diag_sample_identity_map(phase)
+
+    try:
+        rows = (
+            db.session.query(Apps, Titles.title_id)
+            .join(Titles, Apps.title_id == Titles.id)
+            .filter(Apps.app_type == APP_TYPE_BASE)
+            .order_by(Apps.title_id.asc(), Apps.id.asc())
+            .all()
+        )
+        grouped_apps = {}
+        for app_row, title_id in rows:
+            title_key = str(title_id or '').strip().upper()
+            if not title_key:
+                continue
+            grouped_apps.setdefault(title_key, []).append(app_row)
+
+        for index, (title_id, base_apps) in enumerate(grouped_apps.items(), start=1):
+            canonical, duplicates, group_merged_files, normalized = _merge_base_app_group(base_apps, title_id)
+            if canonical is None:
+                continue
+
+            for duplicate in duplicates:
+                db.session.delete(duplicate)
+            if duplicates:
+                db.session.flush()
+
+            merged_files += int(group_merged_files or 0)
+            removed_apps += len(duplicates)
+            if duplicates or normalized:
+                merged_titles += 1
+            if normalized:
+                normalized_apps += 1
+
+            if index % _IDENTIFY_COMMIT_INTERVAL == 0:
+                db.session.commit()
+                db.session.expunge_all()
+                _diag_sample_identity_map(phase)
+
+        db.session.commit()
+        db.session.expunge_all()
+        _diag_sample_identity_map(phase)
+        if merged_titles:
+            logger.info(
+                "Reconciled duplicate base apps for %s title(s): removed %s duplicate app row(s), merged %s file link(s), normalized %s canonical app(s).",
+                merged_titles,
+                removed_apps,
+                merged_files,
+                normalized_apps,
+            )
+        gc.collect()
+        _diag_note_gc(phase)
+    except Exception as e:
+        _diag_phase_error(phase, e)
+        raise
+    finally:
+        _diag_phase_end(
+            phase,
+            merged_titles=merged_titles,
+            removed_apps=removed_apps,
+            merged_files=merged_files,
+            normalized_apps=normalized_apps
         )
 
 def add_missing_apps_to_db():
