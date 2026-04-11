@@ -1006,13 +1006,16 @@
             const card = $('<div class="card text-bg-dark game-card"></div>');
 
             const cacheBannerSrc = game.title_id ? `/api/shop/banner/${game.title_id}?size=web` : '';
+            const directBannerSrc = ((game.banner_url || game.bannerUrl || '') + '').trim();
             const bannerFallback = '/static/placeholder-banner.svg';
-            const img = $('<img class="card-img"></img>').attr('src', cacheBannerSrc || bannerFallback);
+            const img = $('<img class="card-img"></img>').attr('src', cacheBannerSrc || directBannerSrc || bannerFallback);
             img.on('error', function () {
-                if (!this.dataset.triedFallback) {
-                    this.dataset.triedFallback = '1';
-                    this.src = bannerFallback;
+                if (!this.dataset.triedDirect && directBannerSrc && this.src !== directBannerSrc) {
+                    this.dataset.triedDirect = '1';
+                    this.src = directBannerSrc;
+                    return;
                 }
+                this.src = bannerFallback;
             });
             card.append(img);
 
@@ -1097,6 +1100,7 @@
                 .attr('data-bs-app-id', game.app_id)
                 .attr('data-bs-app-type', game.app_type);
             const cacheIconSrc = game.title_id ? `/api/shop/icon/${game.title_id}?size=web` : '';
+            const directIconSrc = ((game.icon_url || game.iconUrl || '') + '').trim();
             const iconFallback = '/static/placeholder-icon.svg';
             const fullTitle = getLibraryDisplayTitle(game);
             const title = escapeHtml(fullTitle);
@@ -1105,7 +1109,7 @@
 
             iconBtn.html(`
                 <div class="discover-tile-body">
-                    <img class="library-icon-img" src="${cacheIconSrc || iconFallback}" alt="">
+                    <img class="library-icon-img" src="${cacheIconSrc || directIconSrc || iconFallback}" alt="">
                     <div class="discover-tile-title" data-bs-toggle="tooltip" data-bs-placement="top" data-bs-title="${title}">${title}</div>
                     <div class="discover-tile-subtitle">${genre}</div>
                 </div>
@@ -1113,10 +1117,12 @@
 
             const img = iconBtn.find('img');
             img.on('error', function () {
-                if (!this.dataset.triedFallback) {
-                    this.dataset.triedFallback = '1';
-                    this.src = iconFallback;
+                if (!this.dataset.triedDirect && directIconSrc && this.src !== directIconSrc) {
+                    this.dataset.triedDirect = '1';
+                    this.src = directIconSrc;
+                    return;
                 }
+                this.src = iconFallback;
             });
             const item = $('<div class="library-icon-item"></div>');
             item.append(iconBtn);

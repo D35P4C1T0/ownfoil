@@ -727,6 +727,10 @@ def _get_cached_titles_total(cache_key):
             return None
 
 
+def _normalize_titles_per_page(requested_per_page):
+    return max(1, min(int(requested_per_page or 50), 1000))
+
+
 def _store_titles_total(cache_key, total):
     if TITLES_TOTAL_CACHE_TTL_S == 0:
         return
@@ -5169,7 +5173,7 @@ def get_all_titles_api():
     start_ts = time.time()
 
     page = max(1, request.args.get('page', 1, type=int))
-    per_page = max(1, min(request.args.get('per_page', 50, type=int), 200))
+    per_page = _normalize_titles_per_page(request.args.get('per_page', 50, type=int))
     lite = str(request.args.get('lite', '')).lower() in ('1', 'true', 'yes')
     sort_key = str(request.args.get('sort') or 'title_asc').strip().lower()
     search = (request.args.get('search') or '').strip()

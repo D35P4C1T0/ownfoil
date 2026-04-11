@@ -22,6 +22,7 @@ try:
     from app.app import _app_has_deletable_files
     from app.app import _build_title_details_dlc_items
     from app.app import _build_deletable_version_map
+    from app.app import _normalize_titles_per_page
     from app.app import _prefetch_media_cache
     from app.app import _sort_library_rows_by_title_name
     from app.app import manage_delete_library_content
@@ -117,6 +118,12 @@ class LibraryHelperTests(unittest.TestCase):
             [row.title_id for row in desc_rows],
             ["0100AAAA00000000", "0100BBBB00000000", "0100CCCC00000000"],
         )
+
+    def test_normalize_titles_per_page_preserves_ui_999_value(self):
+        self.assertEqual(_normalize_titles_per_page(999), 999)
+
+    def test_normalize_titles_per_page_caps_large_values(self):
+        self.assertEqual(_normalize_titles_per_page(5000), 1000)
 
     def test_sanitize_component(self):
         self.assertEqual(_sanitize_component('Game: Name?'), 'Game Name')
